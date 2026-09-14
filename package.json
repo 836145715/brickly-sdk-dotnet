@@ -1,0 +1,12 @@
+{
+  "name": "brickly-sdk-dotnet",
+  "private": true,
+  "version": "0.11.0",
+  "description": "Brickly .NET SDK 测试依赖（真宿主工件）。NuGet 包见 src/Syllm.Brickly.Sdk。",
+  "scripts": {
+    "test:host": "dotnet test tests/Syllm.Brickly.Sdk.Tests --filter HostConformanceTests"
+  },
+  "devDependencies": {
+    "@syllm/brickly-test-host": "0.11.0"
+  }
+}

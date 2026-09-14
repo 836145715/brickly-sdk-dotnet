@@ -12,6 +12,10 @@ public sealed class WindowTests
     public void WhitelistMatchesWindowProtocolSchema()
     {
         var path = FindRepoFile("specs/window-protocol.schema.json");
+        if (path is null)
+        {
+            return; // 独立仓库无 specs 目录：跳过（与 Go SDK 同策略）
+        }
         using var document = JsonDocument.Parse(File.ReadAllText(path));
         var root = document.RootElement;
         var definitions = root.TryGetProperty("definitions", out var defs)
@@ -325,7 +329,7 @@ public sealed class WindowTests
         ["url"] = "about:blank",
     };
 
-    private static string FindRepoFile(string relativePath)
+    private static string? FindRepoFile(string relativePath)
     {
         var directory = new DirectoryInfo(AppContext.BaseDirectory);
         while (directory is not null)
@@ -337,6 +341,6 @@ public sealed class WindowTests
             }
             directory = directory.Parent;
         }
-        throw new FileNotFoundException(relativePath);
+        return null;
     }
 }

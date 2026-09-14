@@ -4,3 +4,4 @@ TestResults/
 artifacts/
 *.nupkg
 *.snupkg
+node_modules/ 
