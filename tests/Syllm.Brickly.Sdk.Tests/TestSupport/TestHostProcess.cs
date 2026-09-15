@@ -39,6 +39,7 @@ internal sealed class TestHostProcess : IDisposable
         {
             RedirectStandardInput = true,
             RedirectStandardOutput = true,
+            RedirectStandardError = true,
             UseShellExecute = false
         };
         Process process;
@@ -52,6 +53,19 @@ internal sealed class TestHostProcess : IDisposable
         }
 
         var host = new TestHostProcess(process);
+        // stderr 必须持续排空：管道缓冲写满会卡死宿主子进程。
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                while (await process.StandardError.ReadLineAsync() is { })
+                {
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        });
         try
         {
             var lineTask = process.StandardOutput.ReadLineAsync();
@@ -114,6 +128,95 @@ internal sealed class TestHostProcess : IDisposable
         return body?.Calls ?? [];
     }
 
+    // —— host→runtime 驱动面（0.12.0 起） ——
+
+    /// <summary>铸一套 spawn 凭据；测试用它注入环境变量启动真 Runtime。</summary>
+    public async Task<SpawnInfo> SpawnAsync(
+        string brickId,
+        string? instanceId = null,
+        string? origin = null,
+        string? version = null)
+    {
+        var info = await PostAsync<SpawnInfo>(
+            "/spawn", new { brickId, instanceId, origin, version }).ConfigureAwait(false);
+        if (string.IsNullOrEmpty(info.SpawnId) || string.IsNullOrEmpty(info.HostToRuntimeToken))
+        {
+            throw new InvalidOperationException($"spawn 响应缺字段: {JsonSerializer.Serialize(info)}");
+        }
+        return info;
+    }
+
+    /// <summary>经控制面反向 invoke runtime 命令；ok=false 时 error 含 brickCode/message。</summary>
+    public Task<DriveReply> InvokeAsync(
+        string? spawnId,
+        string commandId,
+        object? input,
+        int timeoutMs = 8000,
+        string? invocationId = null) =>
+        PostAsync<DriveReply>("/invoke", new { spawnId, commandId, input, timeoutMs, invocationId });
+
+    /// <summary>批量 interact：开会话、关输入、收完事件与最终结果返回。</summary>
+    public Task<DriveReply> InteractAsync(
+        string? spawnId,
+        string commandId,
+        object? input,
+        int timeoutMs = 8000,
+        string? invocationId = null) =>
+        PostAsync<DriveReply>("/interact", new { spawnId, commandId, input, timeoutMs, invocationId });
+
+    /// <summary>接通依赖调用内核：connector start/handle 调用路由到已注册 runtime。</summary>
+    public async Task EnableDependencyKernelAsync(params string[] commands)
+    {
+        _ = await PostAsync<JsonElement>(
+            "/kernel/dependency", new { commands }).ConfigureAwait(false);
+    }
+
+    /// <summary>往指定 runtime 的事件订阅流推一条 domain event。</summary>
+    public async Task PushEventAsync(string? spawnId, string topic, object? payload)
+    {
+        _ = await PostAsync<JsonElement>("/events/push", new { spawnId, topic, payload }).ConfigureAwait(false);
+    }
+
+    /// <summary>给 ui.* 平台调用装罐头响应。</summary>
+    public async Task SetUiResponseAsync(string method, object? result)
+    {
+        _ = await PostAsync<JsonElement>("/ui-handler", new { method, result }).ConfigureAwait(false);
+    }
+
+    /// <summary>已注册的 runtime handle 列表。</summary>
+    public Task<JsonElement> RuntimesAsync() => GetAsync<JsonElement>("/runtimes");
+
+    /// <summary>控制面录制到的 UI 平台调用。</summary>
+    public async Task<IReadOnlyList<UiCallRecord>> UiCallsAsync()
+    {
+        var body = await GetAsync<UiCallsResponse>("/ui-calls").ConfigureAwait(false);
+        return body?.Calls ?? [];
+    }
+
+    private async Task<T> PostAsync<T>(string path, object body)
+    {
+        var response = await _http.PostAsJsonAsync(path, body).ConfigureAwait(false);
+        var payload = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"控制面 {path} 返回 {(int)response.StatusCode}: {payload}");
+        }
+        return JsonSerializer.Deserialize<T>(payload)
+            ?? throw new InvalidOperationException($"控制面 {path} 响应解析失败: {payload}");
+    }
+
+    private async Task<T> GetAsync<T>(string path)
+    {
+        var response = await _http.GetAsync(path).ConfigureAwait(false);
+        var payload = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"控制面 {path} 返回 {(int)response.StatusCode}: {payload}");
+        }
+        return JsonSerializer.Deserialize<T>(payload)
+            ?? throw new InvalidOperationException($"控制面 {path} 响应解析失败: {payload}");
+    }
+
     public void Dispose()
     {
         try { _process.StandardInput.Close(); } catch { }
@@ -129,6 +232,42 @@ internal sealed class TestHostProcess : IDisposable
     public sealed record RecordedCall(
         [property: JsonPropertyName("path")] string Path,
         [property: JsonPropertyName("at")] long At);
+
+    public sealed record SpawnInfo(
+        [property: JsonPropertyName("spawnId")] string SpawnId,
+        [property: JsonPropertyName("bootstrapToken")] string BootstrapToken,
+        [property: JsonPropertyName("runtimeToHostToken")] string RuntimeToHostToken,
+        [property: JsonPropertyName("hostToRuntimeToken")] string HostToRuntimeToken,
+        [property: JsonPropertyName("brickId")] string? BrickId,
+        [property: JsonPropertyName("instanceId")] string? InstanceId);
+
+    /// <summary>invoke/interact 的结构化结果；Ok=false 时 Error 非空。</summary>
+    public sealed class DriveReply
+    {
+        [JsonPropertyName("ok")] public bool Ok { get; set; }
+        /// <summary>本次调用使用的 invocationId（驱动面生成或请求方指定）。</summary>
+        [JsonPropertyName("invocationId")] public string? InvocationId { get; set; }
+        [JsonPropertyName("result")] public JsonElement Result { get; set; }
+        [JsonPropertyName("events")] public List<JsonElement>? Events { get; set; }
+        [JsonPropertyName("error")] public DriveError? Error { get; set; }
+    }
+
+    public sealed class DriveError
+    {
+        [JsonPropertyName("brickCode")] public string? BrickCode { get; set; }
+        [JsonPropertyName("message")] public string? Message { get; set; }
+        [JsonPropertyName("grpcStatus")] public int? GrpcStatus { get; set; }
+    }
+
+    public sealed record UiCallRecord(
+        [property: JsonPropertyName("method")] string Method,
+        [property: JsonPropertyName("args")] JsonElement Args,
+        [property: JsonPropertyName("at")] long At);
+
+    private sealed class UiCallsResponse
+    {
+        [JsonPropertyName("calls")] public List<UiCallRecord>? Calls { get; set; }
+    }
 
     private sealed class CallsResponse
     {

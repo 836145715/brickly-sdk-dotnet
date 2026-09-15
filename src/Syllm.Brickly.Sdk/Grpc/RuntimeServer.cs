@@ -98,13 +98,13 @@ internal sealed class HostTokenInterceptor : Interceptor
         _options = options;
     }
 
-    public override Task<TResponse> UnaryServerHandler<TRequest, TResponse>(
+    public override async Task<TResponse> UnaryServerHandler<TRequest, TResponse>(
         TRequest request,
         ServerCallContext context,
         UnaryServerMethod<TRequest, TResponse> continuation)
     {
         Authorize(context);
-        return continuation(request, context);
+        return await continuation(request, context).ConfigureAwait(false);
     }
 
     public override Task<TResponse> ClientStreamingServerHandler<TRequest, TResponse>(
@@ -126,14 +126,14 @@ internal sealed class HostTokenInterceptor : Interceptor
         return continuation(request, responseStream, context);
     }
 
-    public override Task DuplexStreamingServerHandler<TRequest, TResponse>(
+    public override async Task DuplexStreamingServerHandler<TRequest, TResponse>(
         IAsyncStreamReader<TRequest> requestStream,
         IServerStreamWriter<TResponse> responseStream,
         ServerCallContext context,
         DuplexStreamingServerMethod<TRequest, TResponse> continuation)
     {
         Authorize(context);
-        return continuation(requestStream, responseStream, context);
+        await continuation(requestStream, responseStream, context);
     }
 
     private void Authorize(ServerCallContext context)
@@ -215,11 +215,11 @@ internal sealed class BrickCommandServiceImpl : BrickCommandService.BrickCommand
         }
     }
 
-    public override Task Interact(
+    public override async Task Interact(
         IAsyncStreamReader<ClientFrame> requestStream,
         IServerStreamWriter<ServerFrame> responseStream,
-        ServerCallContext context)
-    {
-        return InteractServer.RunAsync(requestStream, responseStream, context, _options.Dispatcher);
-    }
+        ServerCallContext context) =>
+        await InteractServer
+            .RunAsync(requestStream, responseStream, context, _options.Dispatcher)
+            .ConfigureAwait(false);
 }

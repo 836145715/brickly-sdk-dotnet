@@ -53,27 +53,47 @@ internal static class InteractServer
         };
 
         var handlerTask = Task.Run(() => dispatcher.DispatchInteractAsync(first.Open.CommandId, session));
-        var readerTask = Task.Run(() => ReadLoopAsync(requestStream, session, context.CancellationToken));
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(context.CancellationToken);
+        var readerTask = Task.Run(() => ReadLoopAsync(requestStream, session, readCts.Token));
 
-        object? result;
         try
         {
-            result = await handlerTask.ConfigureAwait(false);
-        }
-        catch (Exception error)
-        {
+            object? result;
+            try
+            {
+                result = await handlerTask.ConfigureAwait(false);
+            }
+            catch (Exception error)
+            {
+                session.CloseInput();
+                await session.SettleRequestsAsync().ConfigureAwait(false);
+                throw BrickErrorStatus.ToRpcException(error);
+            }
+
             session.CloseInput();
             await session.SettleRequestsAsync().ConfigureAwait(false);
-            throw BrickErrorStatus.ToRpcException(error);
+
+            var final = BrickValueCodec.FromClr(result);
+            await WriteAsync(new ServerFrame { Final = new FinalFrame { Result = final } }).ConfigureAwait(false);
         }
-
-        session.CloseInput();
-        await session.SettleRequestsAsync().ConfigureAwait(false);
-
-        var final = BrickValueCodec.FromClr(result);
-        await WriteAsync(new ServerFrame { Final = new FinalFrame { Result = final } }).ConfigureAwait(false);
-
-        _ = readerTask;
+        finally
+        {
+            // Kestrel 会跨 stream 池化复用请求体 pipe：RunAsync 返回时读循环若仍挂在
+            // MoveNext 上，悬挂的读会让 pipe 带"读进行中"状态交给下一个请求，
+            // 其 ReadAsync 直接抛 Reading is already in progress（对外表现为
+            // UNKNOWN "Exception was thrown by handler."）。先 CloseInput 放行
+            // 可能阻塞在 PushAsync 的循环（幂等），再取消并等待读循环退出。
+            session.CloseInput();
+            readCts.Cancel();
+            try
+            {
+                await readerTask.ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // ReadLoopAsync 已内吞异常，防御性兜底。
+            }
+        }
     }
 
     private static async Task ReadLoopAsync(
