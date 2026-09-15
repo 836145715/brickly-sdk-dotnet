@@ -19,7 +19,7 @@ public sealed class InvokeTests
             }));
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             var result = await client.InvokeAsync("hello", new { name = "Brickly" });
             var value = Assert.IsType<Dictionary<string, object?>>(BrickValueCodec.ToClr(result.Result));
             Assert.Equal("Hello, Brickly", value["message"]);
@@ -27,7 +27,7 @@ public sealed class InvokeTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -38,7 +38,7 @@ public sealed class InvokeTests
             r.OnCommand("hello", (_, _) => Task.FromResult<object?>(null)));
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             var error = await Assert.ThrowsAsync<RpcException>(() => client.InvokeAsync("nope", null));
             var brick = BrickErrorStatus.TryReadBrickError(error);
             Assert.NotNull(brick);
@@ -47,7 +47,7 @@ public sealed class InvokeTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -57,7 +57,7 @@ public sealed class InvokeTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             var result = await client.InvokeAsync("echo", new { value = 7 });
             var value = Assert.IsType<Dictionary<string, object?>>(BrickValueCodec.ToClr(result.Result));
             Assert.Equal(7L, value["value"]);
@@ -65,7 +65,7 @@ public sealed class InvokeTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -76,7 +76,7 @@ public sealed class InvokeTests
             r.OnCommand("fail", (_, _) => throw new BppException("INVALID_INPUT", "bad input")));
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             var error = await Assert.ThrowsAsync<RpcException>(() => client.InvokeAsync("fail", null));
             Assert.Equal(StatusCode.InvalidArgument, error.StatusCode);
             var brick = BrickErrorStatus.TryReadBrickError(error);
@@ -86,7 +86,7 @@ public sealed class InvokeTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -97,7 +97,7 @@ public sealed class InvokeTests
             r.OnCommand("boom", (_, _) => throw new InvalidOperationException("kaboom")));
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             var error = await Assert.ThrowsAsync<RpcException>(() => client.InvokeAsync("boom", null));
             var brick = BrickErrorStatus.TryReadBrickError(error);
             Assert.Equal("INTERNAL", brick!.Code);
@@ -106,7 +106,7 @@ public sealed class InvokeTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -122,7 +122,7 @@ public sealed class InvokeTests
             }));
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             await client.InvokeAsync("who", null);
             Assert.NotNull(captured);
             Assert.Equal("unknown", captured!.Source);
@@ -130,7 +130,7 @@ public sealed class InvokeTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -171,7 +171,7 @@ public sealed class InvokeTests
             }));
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             await client.InvokeAsync("unary", null);
             Assert.Equal(BppErrorCodes.ProtocolError, Assert.IsType<BppException>(sendError).Code);
             Assert.Equal(BppErrorCodes.ProtocolError, Assert.IsType<BppException>(onEventError).Code);
@@ -180,14 +180,14 @@ public sealed class InvokeTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
     [Fact]
     public async Task RuntimeInvokeOutsideCommandRequiresHost()
     {
-        FakeHost.ClearEnvironment();
+        TestHostProcess.ClearEnvironment();
         await using var runtime = new BricklyRuntime();
         var error = await Assert.ThrowsAsync<BppException>(() => runtime.InvokeAsync("hello", null));
         Assert.Equal(BppErrorCodes.ProtocolError, error.Code);

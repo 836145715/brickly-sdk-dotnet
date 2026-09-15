@@ -40,21 +40,21 @@ public sealed class WindowTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["ui.window.create"] = _ => WindowCreateResult();
-            host.PlatformCallHandlers["ui.window.requestClose"] = _ => new Dictionary<string, object?>
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
+            await host.SetUiResponseAsync("closeWindow", new Dictionary<string, object?>
             {
                 ["status"] = "pending",
-            };
+            });
             var handle = await runtime.UI.CreateBrowserWindowAsync("about:blank");
 
             var result = await handle.CloseAsync();
             Assert.Equal(WindowCloseStatuses.Pending, result.Status);
             Assert.False(handle.IsClosed);
 
-            host.PlatformCallHandlers["ui.window.requestClose"] = _ => new Dictionary<string, object?>
+            await host.SetUiResponseAsync("closeWindow", new Dictionary<string, object?>
             {
                 ["status"] = "closed",
-            };
+            });
             var second = await handle.CloseAsync();
             Assert.Equal(WindowCloseStatuses.Closed, second.Status);
             Assert.True(handle.IsClosed);
@@ -62,7 +62,7 @@ public sealed class WindowTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -72,11 +72,12 @@ public sealed class WindowTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["ui.window.create"] = _ => WindowCreateResult();
-            host.PlatformCallHandlers["ui.window.requestClose"] = _ => new Dictionary<string, object?>
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
+            await host.SetUiResponseAsync("closeWindow", new Dictionary<string, object?>
             {
                 ["status"] = "closed",
-            };
+            });
+            await host.SetUiResponseAsync("callWindow", true);
             var handle = await runtime.UI.CreateBrowserWindowAsync("about:blank");
             await handle.CloseAsync();
             Assert.True(handle.IsClosed);
@@ -90,7 +91,7 @@ public sealed class WindowTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -100,8 +101,8 @@ public sealed class WindowTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["ui.window.create"] = _ => WindowCreateResult();
-            host.PlatformCallHandlers["ui.window.call"] = _ => "Hello Title";
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
+            await host.SetUiResponseAsync("callWindow", "Hello Title");
             var handle = await runtime.UI.CreateBrowserWindowAsync("about:blank");
             var title = await handle.CallAsync<string>("getTitle");
             Assert.Equal("Hello Title", title);
@@ -112,7 +113,7 @@ public sealed class WindowTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -122,7 +123,7 @@ public sealed class WindowTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["ui.window.create"] = _ => WindowCreateResult();
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
             var handle = await runtime.UI.CreateBrowserWindowAsync("about:blank");
             var error = await Assert.ThrowsAsync<BppException>(() => handle.WebContents().SendAsync("channel"));
             Assert.Equal(BppErrorCodes.ParentInvocationRequired, error.Code);
@@ -130,54 +131,46 @@ public sealed class WindowTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
     [Fact]
     public async Task ScopedWindowUsesCallBindingAndSessionWindowUsesSessionBinding()
     {
-        Dictionary<string, object?>? sessionOptions = null;
-        Dictionary<string, object?>? callOptions = null;
-        var host = await FakeHost.StartAsync();
-        host.PlatformCallHandlers["ui.window.create"] = input =>
-        {
-            var payload = (Dictionary<string, object?>)BrickValueCodec.ToClr(input)!;
-            var options = (Dictionary<string, object?>)payload["options"]!;
-            var binding = (Dictionary<string, object?>)options["binding"]!;
-            if (EqualityComparer<object?>.Default.Equals(binding["kind"], "call"))
+        var (host, runtime) = await TestHarness.StartRuntimeAsync(r =>
+            r.OnCommand("open", async (ctx, _) =>
             {
-                callOptions = options;
-            }
-            else
-            {
-                sessionOptions = options;
-            }
-            return WindowCreateResult();
-        };
-        host.ApplyEnvironment();
-        var runtime = new BricklyRuntime().OnCommand("open", async (ctx, _) =>
-        {
-            var window = await ctx.UI().CreateBrowserWindowAsync("about:blank");
-            return window.ID;
-        });
-        await runtime.StartAsync();
-
+                var window = await ctx.UI().CreateBrowserWindowAsync("about:blank");
+                return window.ID;
+            }));
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             await client.InvokeAsync("open", null);
-            Assert.NotNull(callOptions);
-            Assert.Equal("call", ((Dictionary<string, object?>)callOptions!["binding"]!)["kind"]);
+
+            // createBrowserWindow(caller, instanceId, url, options, invocationId)
+            // → args[3] 为 windowOptionsFromWire 透传的 options（含 binding.kind）
+            var callScoped = await host.WaitCallAsync(call =>
+                call.Path.EndsWith("PlatformService/Call", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("method", out var m) &&
+                m.GetString() == "ui.window.create" &&
+                BindingKindOf(call.Request) == "call");
+            Assert.NotNull(callScoped);
 
             await runtime.UI.CreateBrowserWindowAsync("about:blank");
-            Assert.NotNull(sessionOptions);
-            Assert.Equal("session", ((Dictionary<string, object?>)sessionOptions!["binding"]!)["kind"]);
+            var sessionScoped = await host.WaitCallAsync(call =>
+                call.Path.EndsWith("PlatformService/Call", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("method", out var m) &&
+                m.GetString() == "ui.window.create" &&
+                BindingKindOf(call.Request) == "session");
+            Assert.NotNull(sessionScoped);
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -187,19 +180,25 @@ public sealed class WindowTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["ui.window.create"] = _ => WindowCreateResult();
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
             var handle = await runtime.UI.CreateBrowserWindowAsync("about:blank");
             var count = 0;
             using var subscription = handle.On("closed", _ => Interlocked.Increment(ref count));
 
-            var payload = BrickValueCodec.FromClr(new Dictionary<string, object?>
+            // 真宿主要求订阅流已建立再推事件（FakeHost 的内存字典不需要等）
+            await host.WaitCallAsync(call =>
+                call.Path.EndsWith("EventService/Subscribe", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("topic", out var t) &&
+                t.GetString() == "window.closed");
+
+            var payload = new Dictionary<string, object?>
             {
                 ["eventId"] = "event-1",
                 ["windowId"] = 1L,
-            });
-            host.PushDomainEvent("window.closed", payload);
+            };
+            await host.PushEventAsync(host.LastSpawn!.SpawnId, "window.closed", payload);
             await TestHarness.WaitUntilAsync(() => Volatile.Read(ref count) == 1);
-            host.PushDomainEvent("window.closed", payload);
+            await host.PushEventAsync(host.LastSpawn!.SpawnId, "window.closed", payload);
             await Task.Delay(200);
             Assert.Equal(1, Volatile.Read(ref count));
             Assert.True(handle.IsClosed);
@@ -207,7 +206,7 @@ public sealed class WindowTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -217,7 +216,7 @@ public sealed class WindowTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["ui.window.create"] = _ => WindowCreateResult();
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
             var handle = await runtime.UI.CreateBrowserWindowAsync("about:blank");
             Assert.False(handle.IsClosed);
             await runtime.DisposeAsync();
@@ -225,7 +224,7 @@ public sealed class WindowTests
         }
         finally
         {
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -235,28 +234,37 @@ public sealed class WindowTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["ui.window.create"] = _ => WindowCreateResult();
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
+            await host.SetUiResponseAsync("replyToChild", null);
             var handle = await runtime.UI.CreateBrowserWindowAsync("about:blank");
             await handle.ExposeAsync("greet", (payload, _) => Task.FromResult<object?>("hi " + payload));
 
-            host.PushDomainEvent("window.request", BrickValueCodec.FromClr(new Dictionary<string, object?>
+            await host.WaitCallAsync(call =>
+                call.Path.EndsWith("EventService/Subscribe", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("topic", out var t) &&
+                t.GetString() == "window.request");
+
+            await host.PushEventAsync(host.LastSpawn!.SpawnId, "window.request", new Dictionary<string, object?>
             {
                 ["name"] = "greet",
                 ["requestId"] = "req-1",
                 ["windowId"] = 1L,
                 ["payload"] = "bob",
-            }));
+            });
 
-            await TestHarness.WaitUntilAsync(() => host.PlatformCalls.Any(call => call.Method == "ui.window.reply"));
-            var reply = host.PlatformCalls.Last(call => call.Method == "ui.window.reply");
-            var payloadMap = Assert.IsType<Dictionary<string, object?>>(BrickValueCodec.ToClr(reply.Input));
-            Assert.True((bool)payloadMap["ok"]!);
+            var reply = await host.WaitCallAsync(call =>
+                call.Path.EndsWith("PlatformService/Call", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("method", out var m) &&
+                m.GetString() == "ui.window.reply");
+            var payloadMap = Assert.IsType<Dictionary<string, object?>>(
+                WireValue.InputOf(reply.Request));
+            Assert.Equal(true, payloadMap["ok"]);
             Assert.Equal("hi bob", payloadMap["result"]);
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -266,7 +274,7 @@ public sealed class WindowTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["ui.window.create"] = _ => WindowCreateResult();
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
             var handle = await runtime.UI.CreateBrowserWindowAsync("about:blank");
             var error = await Assert.ThrowsAsync<BppException>(
                 () => handle.ExposeAsync("brickly:internal", (_, _) => Task.FromResult<object?>(null)));
@@ -275,7 +283,7 @@ public sealed class WindowTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -285,31 +293,30 @@ public sealed class WindowTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["ui.window.create"] = _ => WindowCreateResult();
-            host.PlatformCallHandlers["ui.window.call"] = input =>
+            await host.SetUiResponseAsync("createBrowserWindow", WindowCreateResult());
+            // setSize 走 CallVoidAsync 忽略返回值，单一罐头即可覆盖两种 method
+            await host.SetUiResponseAsync("callWindow", new Dictionary<string, object?>
             {
-                var payload = (Dictionary<string, object?>)BrickValueCodec.ToClr(input)!;
-                if (Equals(payload["method"], "getBounds"))
-                {
-                    return new Dictionary<string, object?>
-                    {
-                        ["x"] = 1L,
-                        ["y"] = 2L,
-                        ["width"] = 640L,
-                        ["height"] = 480L,
-                    };
-                }
-                return true;
-            };
+                ["x"] = 1L,
+                ["y"] = 2L,
+                ["width"] = 640L,
+                ["height"] = 480L,
+            });
             var handle = await runtime.UI.CreateBrowserWindowAsync("about:blank");
             var bounds = await handle.GetBoundsAsync();
             Assert.Equal(640, bounds.Width);
             Assert.Equal(480, bounds.Height);
             await handle.SetSizeAsync(800, 600);
 
-            var call = host.PlatformCalls.Last(call => call.Method == "ui.window.call");
-            var payloadMap = Assert.IsType<Dictionary<string, object?>>(BrickValueCodec.ToClr(call.Input));
-            Assert.Equal("setSize", payloadMap["method"]);
+            var call = await host.WaitCallAsync(item =>
+                item.Path.EndsWith("PlatformService/Call", StringComparison.Ordinal) &&
+                item.Request.TryGetProperty("method", out var m) &&
+                m.GetString() == "ui.window.call" &&
+                WireValue.InputOf(item.Request) is Dictionary<string, object?> input &&
+                input.TryGetValue("method", out var name) &&
+                Equals(name, "setSize"));
+            var payloadMap = Assert.IsType<Dictionary<string, object?>>(
+                WireValue.InputOf(call.Request));
             var args = Assert.IsType<List<object?>>(payloadMap["args"]);
             Assert.Equal(800L, Convert.ToInt64(args[0]));
             Assert.Equal(600L, Convert.ToInt64(args[1]));
@@ -317,8 +324,22 @@ public sealed class WindowTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
+    }
+
+    /// <summary>从录制的 ui.window.create 请求体解出 options.binding.kind。</summary>
+    private static string? BindingKindOf(JsonElement request)
+    {
+        if (WireValue.InputOf(request) is not Dictionary<string, object?> input ||
+            !input.TryGetValue("options", out var options) ||
+            options is not Dictionary<string, object?> optionMap ||
+            !optionMap.TryGetValue("binding", out var binding) ||
+            binding is not Dictionary<string, object?> bindingMap)
+        {
+            return null;
+        }
+        return bindingMap.TryGetValue("kind", out var kind) ? kind as string : null;
     }
 
     private static Dictionary<string, object?> WindowCreateResult() => new()

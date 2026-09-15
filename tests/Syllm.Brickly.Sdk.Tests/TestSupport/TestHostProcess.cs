@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
 namespace Syllm.Brickly.Sdk.Tests.TestSupport;
@@ -12,7 +13,7 @@ namespace Syllm.Brickly.Sdk.Tests.TestSupport;
 /// 找 node_modules/@syllm/brickly-test-host/dist/host.cjs（monorepo 命中根
 /// workspace 链接；独立仓库命中本仓 node_modules）。
 /// </summary>
-internal sealed class TestHostProcess : IDisposable
+public sealed class TestHostProcess : IDisposable
 {
     private readonly Process _process;
     private readonly HttpClient _http = new();
@@ -20,6 +21,9 @@ internal sealed class TestHostProcess : IDisposable
     public string DataEndpoint { get; private set; } = string.Empty;
     public string ControlEndpoint { get; private set; } = string.Empty;
     public string RuntimeToHostToken { get; private set; } = string.Empty;
+
+    /// <summary>最近一次 SpawnAsync 铸出的凭据（StartRuntimeAsync 默认 spawn 的那套）。</summary>
+    public SpawnInfo? LastSpawn { get; private set; }
 
     private TestHostProcess(Process process)
     {
@@ -109,11 +113,54 @@ internal sealed class TestHostProcess : IDisposable
         return null;
     }
 
+    /// <summary>故障注入：error 短路（brickCode）/hang（挂死）/delay（延迟）。</summary>
     public async Task SetFaultAsync(string path, string brickCode, int count = 1)
     {
         var response = await _http.PostAsJsonAsync(
             "/faults", new { path, brickCode, count }).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>hang 剧本：命中 path 的调用永不应答（客户端 deadline/取消路径测试）。</summary>
+    public async Task SetHangFaultAsync(string path)
+    {
+        var response = await _http.PostAsJsonAsync(
+            "/faults", new { path, action = "hang" }).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>写入 Runtime 启动环境变量（spawn 凭据 → BRICKLY_* 进程环境）。</summary>
+    public void ApplyEnvironment(
+        SpawnInfo? spawn = null,
+        string? dependencyBindings = null,
+        string? profileConfig = null)
+    {
+        var creds = spawn ?? LastSpawn
+            ?? throw new InvalidOperationException("尚无 spawn 凭据，先 SpawnAsync");
+        Environment.SetEnvironmentVariable("BRICKLY_HOST_ENDPOINT", DataEndpoint);
+        Environment.SetEnvironmentVariable("BRICKLY_BOOTSTRAP_TOKEN", creds.BootstrapToken);
+        Environment.SetEnvironmentVariable("BRICKLY_RUNTIME_TO_HOST_TOKEN", creds.RuntimeToHostToken);
+        Environment.SetEnvironmentVariable("BRICKLY_HOST_TO_RUNTIME_TOKEN", creds.HostToRuntimeToken);
+        Environment.SetEnvironmentVariable("BRICKLY_DEPENDENCY_BINDINGS", dependencyBindings);
+        Environment.SetEnvironmentVariable("BRICKLY_PROFILE_CONFIG", profileConfig);
+    }
+
+    /// <summary>清理全部 BRICKLY_* 环境变量（替代 FakeHost.ClearEnvironment）。</summary>
+    public static void ClearEnvironment()
+    {
+        foreach (var name in new[]
+        {
+            "BRICKLY_HOST_ENDPOINT",
+            "BRICKLY_BOOTSTRAP_TOKEN",
+            "BRICKLY_RUNTIME_TO_HOST_TOKEN",
+            "BRICKLY_HOST_TO_RUNTIME_TOKEN",
+            "BRICKLY_DEPENDENCY_BINDINGS",
+            "BRICKLY_PROFILE_CONFIG",
+            "BRICKLY_PROFILE_ID",
+        })
+        {
+            Environment.SetEnvironmentVariable(name, null);
+        }
     }
 
     public async Task ResetAsync()
@@ -143,6 +190,7 @@ internal sealed class TestHostProcess : IDisposable
         {
             throw new InvalidOperationException($"spawn 响应缺字段: {JsonSerializer.Serialize(info)}");
         }
+        LastSpawn = info;
         return info;
     }
 
@@ -181,6 +229,31 @@ internal sealed class TestHostProcess : IDisposable
     public async Task SetUiResponseAsync(string method, object? result)
     {
         _ = await PostAsync<JsonElement>("/ui-handler", new { method, result }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 任意 wire 平台方法罐头（clipboard.* / screen.* / input.* / system.* /
+    /// runtime.invoke；'$interact' 为 PlatformService.Interact 最终结果罐头）。
+    /// 重复注册覆盖。
+    /// </summary>
+    public async Task SetPlatformResponseAsync(string method, object? result)
+    {
+        _ = await PostAsync<JsonElement>("/platform-handler", new { method, result }).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// interact 裸帧剧本：语义违规帧注入与收流断言（替代 FakeInteractSession）。
+    /// spawnId 缺省时注入 LastSpawn——HTTP 驱动面的 waitHandle 默认等的是宿主自带
+    /// 初始 spawn（无 runtime 注册），不显式指定会等超时。
+    /// </summary>
+    public async Task<InteractScriptReply> InteractScriptAsync(object body)
+    {
+        var payload = JsonSerializer.SerializeToNode(body)!.AsObject();
+        if (payload["spawnId"] is null && LastSpawn is not null)
+        {
+            payload["spawnId"] = LastSpawn.SpawnId;
+        }
+        return await PostAsync<InteractScriptReply>("/interact-script", payload).ConfigureAwait(false);
     }
 
     /// <summary>已注册的 runtime handle 列表。</summary>
@@ -229,9 +302,64 @@ internal sealed class TestHostProcess : IDisposable
         _http.Dispose();
     }
 
+    /// <summary>轮询 /calls 直到出现谓词命中的录制（事件订阅建立等异步等待用）。</summary>
+    public async Task<RecordedCall> WaitCallAsync(
+        Func<RecordedCall, bool> predicate, int timeoutMs = 8000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (true)
+        {
+            var calls = await CallsAsync().ConfigureAwait(false);
+            var found = calls.FirstOrDefault(predicate);
+            if (found is not null)
+            {
+                return found;
+            }
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException(
+                    $"等待录制调用超时；当前 /calls=[{string.Join(", ", calls.Select(c => c.Path))}]");
+            }
+            await Task.Delay(25).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// 第 registerIndex 个 runtime 注册时上报的 endpoint（多 runtime 场景按注册顺序取，
+    /// 后启动的 runtime 用更大的下标）。
+    /// </summary>
+    public async Task<string> RuntimeEndpointAsync(int timeoutMs = 8000, int registerIndex = 0)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (true)
+        {
+            var calls = await CallsAsync().ConfigureAwait(false);
+            var registers = calls
+                .Where(item => item.Path.EndsWith("RuntimeRegistry/Register", StringComparison.Ordinal))
+                .ToList();
+            if (registers.Count > registerIndex)
+            {
+                var endpoint = registers[registerIndex].Request.TryGetProperty("endpoint", out var value)
+                    ? value.GetString()
+                    : null;
+                return endpoint ?? throw new InvalidOperationException("Register 录制缺 endpoint 字段");
+            }
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException(
+                    $"等待第 {registerIndex + 1} 次 Register 录制超时；当前 /calls=[{string.Join(", ", calls.Select(c => c.Path))}]");
+            }
+            await Task.Delay(25).ConfigureAwait(false);
+        }
+    }
+
     public sealed record RecordedCall(
         [property: JsonPropertyName("path")] string Path,
-        [property: JsonPropertyName("at")] long At);
+        [property: JsonPropertyName("at")] long At,
+        [property: JsonPropertyName("invocationId")] string? InvocationId,
+        [property: JsonPropertyName("intent")] string? Intent,
+        [property: JsonPropertyName("request")] JsonElement Request,
+        [property: JsonPropertyName("frames")] int Frames);
 
     public sealed record SpawnInfo(
         [property: JsonPropertyName("spawnId")] string SpawnId,
@@ -257,6 +385,29 @@ internal sealed class TestHostProcess : IDisposable
         [JsonPropertyName("brickCode")] public string? BrickCode { get; set; }
         [JsonPropertyName("message")] public string? Message { get; set; }
         [JsonPropertyName("grpcStatus")] public int? GrpcStatus { get; set; }
+    }
+
+    /// <summary>/interact-script 结构化结果。</summary>
+    public sealed class InteractScriptReply
+    {
+        [JsonPropertyName("ok")] public bool Ok { get; set; }
+        [JsonPropertyName("state")] public string? State { get; set; }
+        [JsonPropertyName("received")] public List<InteractInbound>? Received { get; set; }
+        [JsonPropertyName("failedStep")] public int? FailedStep { get; set; }
+        [JsonPropertyName("error")] public string? Error { get; set; }
+    }
+
+    /// <summary>剧本面入站帧录制（kind: opened/event/response/final/end/error）。</summary>
+    public sealed class InteractInbound
+    {
+        [JsonPropertyName("kind")] public string? Kind { get; set; }
+        [JsonPropertyName("sequence")] public long Sequence { get; set; }
+        [JsonPropertyName("messageId")] public string? MessageId { get; set; }
+        [JsonPropertyName("replyTo")] public string? ReplyTo { get; set; }
+        [JsonPropertyName("event")] public JsonElement Event { get; set; }
+        [JsonPropertyName("response")] public JsonElement Response { get; set; }
+        [JsonPropertyName("final")] public JsonElement Final { get; set; }
+        [JsonPropertyName("error")] public string? Error { get; set; }
     }
 
     public sealed record UiCallRecord(

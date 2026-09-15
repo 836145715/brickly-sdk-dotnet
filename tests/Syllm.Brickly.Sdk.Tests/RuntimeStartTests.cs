@@ -12,7 +12,7 @@ public sealed class RuntimeStartTests
     [Fact]
     public async Task StartRejectsMissingHostEndpoint()
     {
-        FakeHost.ClearEnvironment();
+        TestHostProcess.ClearEnvironment();
         await using var runtime = new BricklyRuntime();
         var error = await Assert.ThrowsAsync<BppException>(() => runtime.StartAsync());
         Assert.Equal(BppErrorCodes.ProtocolError, error.Code);
@@ -27,20 +27,26 @@ public sealed class RuntimeStartTests
                 .OnCommand("live", (_, _) => Task.FromResult<object?>(null)));
         try
         {
-            Assert.NotNull(host.Register);
-            Assert.Equal(1u, host.Register!.Protocol.Major);
-            Assert.Equal(0u, host.Register.Protocol.Minor);
-            Assert.True(host.Register.Capabilities.SupportsInteract);
-            Assert.Contains("hello", host.Register.Capabilities.Commands);
-            Assert.Contains("live", host.Register.Capabilities.Commands);
-            Assert.False(string.IsNullOrEmpty(host.Register.Endpoint));
-            Assert.Equal(host.BootstrapToken, host.RegisterBootstrapToken);
-            Assert.Equal(host.RuntimeHandleId, runtime.RuntimeHandleId);
+            // 真宿主校验 bootstrap token（spawn-registry byBootstrap）：
+            // 能注册成功即证明 token 正确，无需再读 metadata 断言。
+            var register = await host.WaitCallAsync(
+                call => call.Path.EndsWith("RuntimeRegistry/Register", StringComparison.Ordinal));
+            var request = register.Request;
+            Assert.Equal(1, request.GetProperty("protocol").GetProperty("major").GetInt32());
+            Assert.Equal(0, request.GetProperty("protocol").GetProperty("minor").GetInt32());
+            var capabilities = request.GetProperty("capabilities");
+            Assert.True(capabilities.GetProperty("supportsInteract").GetBoolean());
+            var commands = capabilities.GetProperty("commands")
+                .EnumerateArray().Select(item => item.GetString()).ToList();
+            Assert.Contains("hello", commands);
+            Assert.Contains("live", commands);
+            Assert.False(string.IsNullOrEmpty(request.GetProperty("endpoint").GetString()));
+            Assert.False(string.IsNullOrEmpty(runtime.RuntimeHandleId));
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -51,7 +57,7 @@ public sealed class RuntimeStartTests
             r.OnCommand("hello", (_, _) => Task.FromResult<object?>(null)));
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             var error = await Assert.ThrowsAsync<RpcException>(
                 () => client.InvokeWithWrongTokenAsync("hello"));
             Assert.Equal(StatusCode.Unauthenticated, error.StatusCode);
@@ -59,7 +65,7 @@ public sealed class RuntimeStartTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -69,10 +75,13 @@ public sealed class RuntimeStartTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            var endpoint = host.Register!.Endpoint;
+            var endpoint = await host.RuntimeEndpointAsync();
             using var channel = GrpcChannel.ForAddress("http://" + endpoint);
             var client = new Health.HealthClient(channel);
-            var metadata = new Metadata { { "x-brickly-host-token", host.HostToRuntimeToken } };
+            var metadata = new Metadata
+            {
+                { "x-brickly-host-token", host.LastSpawn!.HostToRuntimeToken },
+            };
             var response = await client.CheckAsync(
                 new HealthCheckRequest { Service = "global::Brickly.Runtime.V1.BrickCommandService" },
                 metadata);
@@ -81,7 +90,7 @@ public sealed class RuntimeStartTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -92,12 +101,20 @@ public sealed class RuntimeStartTests
         await runtime.DisposeAsync();
         try
         {
-            Assert.True(host.Unregistered);
-            Assert.Equal(host.RuntimeToHostToken, host.UnregisterRuntimeToken);
+            var unregister = await host.WaitCallAsync(
+                call => call.Path.EndsWith("RuntimeRegistry/Unregister", StringComparison.Ordinal));
+            Assert.NotNull(unregister);
+            // 真宿主语义：unregister 后 handle 从 /runtimes 消失
+            await TestHarness.WaitUntilAsync(async () =>
+            {
+                var runtimes = await host.RuntimesAsync();
+                return !runtimes.GetProperty("runtimes").EnumerateArray().Any(item =>
+                    item.GetProperty("spawnId").GetString() == host.LastSpawn!.SpawnId);
+            });
         }
         finally
         {
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -112,11 +129,14 @@ public sealed class RuntimeStartTests
             }));
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             await client.InvokeAsync("log", null, invocationId: "inv-1");
-            await TestHarness.WaitUntilAsync(() => host.PlatformCalls.Any(call => call.Method == "diagnostics.log"));
-            var logCall = host.PlatformCalls.First(call => call.Method == "diagnostics.log");
-            var payload = Assert.IsType<Dictionary<string, object?>>(BrickValueCodec.ToClr(logCall.Input));
+            var logCall = await host.WaitCallAsync(call =>
+                call.Path.EndsWith("PlatformService/Call", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("method", out var method) &&
+                method.GetString() == "diagnostics.log");
+            var payload = Assert.IsType<Dictionary<string, object?>>(
+                WireValue.InputOf(logCall.Request));
             Assert.Equal("info", payload["level"]);
             Assert.Equal("hello log", payload["message"]);
             Assert.Equal("inv-1", payload["invocationId"]);
@@ -124,7 +144,7 @@ public sealed class RuntimeStartTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -145,7 +165,7 @@ public sealed class RuntimeStartTests
         }
         finally
         {
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 }

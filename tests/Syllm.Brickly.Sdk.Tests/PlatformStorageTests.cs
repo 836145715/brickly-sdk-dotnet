@@ -13,28 +13,41 @@ public sealed class PlatformStorageTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            var received = new TaskCompletionSource<Dictionary<string, object?>>(
-                TaskCreationOptions.RunContinuationsAsynchronously);
+            var received = System.Threading.Channels.Channel.CreateUnbounded<Dictionary<string, object?>>();
             using var subscription = runtime.Events.On("my-brick:tick", (payload, _) =>
             {
                 if (payload is Dictionary<string, object?> map)
                 {
-                    received.TrySetResult(map);
+                    received.Writer.TryWrite(map);
                 }
             });
-            await TestHarness.WaitUntilAsync(() => host.SubscribedTopics.Contains("my-brick:tick"));
+            // 订阅是 server-streaming 调用，录制到 Subscribe 才算投递就绪
+            await host.WaitCallAsync(call =>
+                call.Path.EndsWith("EventService/Subscribe", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("topic", out var t) &&
+                t.GetString() == "my-brick:tick");
 
+            // 真宿主语义：publish 经 HostEventBus 环回投递给本 runtime 的订阅流
             await runtime.Events.PublishAsync("my-brick:tick", new { n = 1 });
-            await TestHarness.WaitUntilAsync(() => host.PublishedEvents.Any(e => e.Topic == "my-brick:tick"));
+            await host.WaitCallAsync(call =>
+                call.Path.EndsWith("EventService/Publish", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("topic", out var t) &&
+                t.GetString() == "my-brick:tick");
 
-            host.PushDomainEvent("my-brick:tick", BrickValueCodec.FromClr(new { n = 2 }));
-            var value = await received.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.Equal(2L, value["n"]);
+            await host.PushEventAsync(
+                host.LastSpawn!.SpawnId,
+                "my-brick:tick",
+                new Dictionary<string, object?> { ["n"] = 2L });
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            var echoed = await received.Reader.ReadAsync(timeout.Token);
+            Assert.Equal(1L, Convert.ToInt64(echoed["n"]));
+            var pushed = await received.Reader.ReadAsync(timeout.Token);
+            Assert.Equal(2L, Convert.ToInt64(pushed["n"]));
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -54,7 +67,7 @@ public sealed class PlatformStorageTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -64,18 +77,21 @@ public sealed class PlatformStorageTests
         var (host, runtime) = await TestHarness.StartRuntimeAsync();
         try
         {
-            host.PlatformCallHandlers["clipboard.readContent"] = _ => new Dictionary<string, object?>
+            await host.SetPlatformResponseAsync("clipboard.readContent", new Dictionary<string, object?>
             {
                 ["kind"] = "text",
                 ["text"] = "clip",
-            };
-            host.PlatformCallHandlers["screen.getPrimaryDisplay"] = _ => new Dictionary<string, object?>
+            });
+            await host.SetPlatformResponseAsync("screen.getPrimaryDisplay", new Dictionary<string, object?>
             {
                 ["id"] = 1L,
                 ["width"] = 1920L,
-            };
-            host.PlatformCallHandlers["system.getPath"] = _ => "C:/data";
-            host.PlatformCallHandlers["system.isWindows"] = _ => true;
+            });
+            await host.SetPlatformResponseAsync("system.getPath", "C:/data");
+            await host.SetPlatformResponseAsync("system.isWindows", true);
+            // 真宿主语义：未注册方法报"宿主未接入"，不再静默返回空值
+            await host.SetPlatformResponseAsync("input.mouseMove", null);
+            await host.SetPlatformResponseAsync("screenshot.selectRegion", null);
 
             var clipboard = await runtime.Platform.Clipboard.ReadContentAsync();
             Assert.Equal("clip", clipboard["text"]);
@@ -91,17 +107,21 @@ public sealed class PlatformStorageTests
             await runtime.Platform.Input.MouseMoveAsync(new ScreenPoint { X = 1, Y = 2 });
             await runtime.Platform.Screenshot.SelectRegionAsync();
 
-            Assert.Contains(host.PlatformCalls, call => call.Method == "clipboard.readContent");
-            Assert.Contains(host.PlatformCalls, call => call.Method == "screen.getPrimaryDisplay");
-            var getPath = host.PlatformCalls.First(call => call.Method == "system.getPath");
-            Assert.Equal("userData", BrickValueCodec.ToClr(getPath.Input));
-            Assert.Contains(host.PlatformCalls, call => call.Method == "input.mouseMove");
-            Assert.Contains(host.PlatformCalls, call => call.Method == "screenshot.selectRegion");
+            var calls = await host.CallsAsync();
+            var platformCalls = calls
+                .Where(call => call.Path.EndsWith("PlatformService/Call", StringComparison.Ordinal))
+                .ToList();
+            Assert.Contains(platformCalls, call => MethodIs(call, "clipboard.readContent"));
+            Assert.Contains(platformCalls, call => MethodIs(call, "screen.getPrimaryDisplay"));
+            var getPath = platformCalls.First(call => MethodIs(call, "system.getPath"));
+            Assert.Equal("userData", WireValue.InputOf(getPath.Request));
+            Assert.Contains(platformCalls, call => MethodIs(call, "input.mouseMove"));
+            Assert.Contains(platformCalls, call => MethodIs(call, "screenshot.selectRegion"));
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -124,12 +144,13 @@ public sealed class PlatformStorageTests
             Assert.Null(await runtime.Storage.KV.GetAsync("name"));
 
             var status = await runtime.Storage.StatusAsync();
-            Assert.True((bool)status["signedIn"]!);
+            // 真实内存宿主未接账号体系：signedIn=false（FakeHost 曾演成 true，属语义漂移）
+            Assert.False((bool)status["signedIn"]!);
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -155,7 +176,7 @@ public sealed class PlatformStorageTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -177,7 +198,7 @@ public sealed class PlatformStorageTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -210,7 +231,7 @@ public sealed class PlatformStorageTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -222,22 +243,25 @@ public sealed class PlatformStorageTests
         {
             var received = new TaskCompletionSource<Dictionary<string, object?>>(
                 TaskCreationOptions.RunContinuationsAsynchronously);
-            var subscription = await runtime.Storage.Collection("notes").WatchAsync(change =>
+            var collection = runtime.Storage.Collection("notes");
+            var subscription = await collection.WatchAsync(change =>
             {
                 received.TrySetResult(change);
             });
             try
             {
-                await TestHarness.WaitUntilAsync(() => host.WatchSubscribers > 0);
-                host.PushWatchEvent(new BrickStorageChangeEvent
+                // WatchDocs 建立后再真写，宿主推送真实变更事件（不再注入内存桩）
+                await host.WaitCallAsync(call =>
+                    call.Path.EndsWith("BrickStorageService/WatchDocs", StringComparison.Ordinal));
+                var created = await collection.CreateAsync(new Dictionary<string, object?>
                 {
-                    Type = "put",
-                    Id = "doc-1",
-                    Doc = BrickValueCodec.FromClr(new Dictionary<string, object?> { ["title"] = "changed" }),
+                    ["title"] = "changed",
                 });
+                var createdId = Assert.IsType<string>(created["id"]);
+
                 var change = await received.Task.WaitAsync(TimeSpan.FromSeconds(5));
                 Assert.Equal("put", change["type"]);
-                Assert.Equal("doc-1", change["id"]);
+                Assert.Equal(createdId, change["id"]);
             }
             finally
             {
@@ -247,7 +271,7 @@ public sealed class PlatformStorageTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -264,7 +288,7 @@ public sealed class PlatformStorageTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -277,14 +301,20 @@ public sealed class PlatformStorageTests
             profileConfig: """{"host":"db"}""");
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = await TestHarness.CreateRuntimeClientAsync(host);
             var result = await client.InvokeAsync("show-config", null);
             Assert.Equal("db", BrickValueCodec.ToClr(result.Result));
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
+    }
+
+    private static bool MethodIs(TestHostProcess.RecordedCall call, string method)
+    {
+        return call.Request.TryGetProperty("method", out var value) &&
+            value.GetString() == method;
     }
 }

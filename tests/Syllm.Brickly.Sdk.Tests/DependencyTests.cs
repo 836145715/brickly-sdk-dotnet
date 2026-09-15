@@ -8,12 +8,15 @@ namespace Syllm.Brickly.Sdk.Tests;
 public sealed class DependencyTests
 {
     private const string Bindings =
-        """{"openai":{"brickId":"com.brickly.openai","origin":"installed","version":"2.1.0"},"review_tool":{"brickId":"com.brickly.openai","origin":"review","version":"2.1.0"}}""";
+        """{"openai":{"brickId":"com.brickly.openai","origin":"installed","version":"2.1.0"}}""";
+
+    private const string TwoBindings =
+        """{"openai":{"brickId":"com.brickly.openai","origin":"installed","version":"2.1.0"},"review_tool":{"brickId":"com.brickly.review","origin":"review","version":"1.3.0"}}""";
 
     [Fact]
     public async Task DependencyBindingsFromEnvAreReadOnlyAndIsolated()
     {
-        var (host, runtime) = await TestHarness.StartRuntimeAsync(dependencyBindings: Bindings);
+        var (host, runtime) = await TestHarness.StartRuntimeAsync(dependencyBindings: TwoBindings);
         try
         {
             var bindings = runtime.Dependencies.Bindings;
@@ -27,7 +30,7 @@ public sealed class DependencyTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -46,7 +49,7 @@ public sealed class DependencyTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -63,114 +66,134 @@ public sealed class DependencyTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
+    /// <summary>
+    /// 命令内 start → invoke → interact → dispose / stop 全链路：
+    /// connector 内核把调用路由到第二个真 runtime（com.brickly.openai）。
+    /// </summary>
     [Fact]
     public async Task StartedHandleInvokeInteractDisposeStop()
     {
-        var host = await FakeHost.StartAsync();
-        host.ConnectorInvokeHandlers[("com.brickly.openai", "chat")] = _ => "chat-ok";
-        host.ConnectorInteractFinalResult = () => BrickValueCodec.FromClr("end-ok");
-        host.ApplyEnvironment(Bindings);
-        var runtime = new BricklyRuntime()
-            .OnCommand("dispose-case", async (ctx, _) =>
-            {
-                var dependency = await ctx.Dependencies().Require("openai").StartAsync();
-                var value = await dependency.InvokeAsync("chat", new { prompt = "x" });
-                var session = await dependency.InteractAsync(
-                    "chat",
-                    null,
-                    new InteractOptions { OnEvent = _ => { } });
-                var final = await session.EndAsync();
-                await dependency.DisposeAsync();
-                return new Dictionary<string, object?> { ["value"] = value, ["final"] = final };
-            })
-            .OnCommand("stop-case", async (ctx, _) =>
-            {
-                var dependency = await ctx.Dependencies().Require("openai").StartAsync();
-                await dependency.StopAsync();
-                return null;
-            });
-        await runtime.StartAsync();
-
+        var fixture = await StartDependencyFixtureAsync(
+            configureCaller: runtime => runtime
+                .OnCommand("dispose-case", async (ctx, _) =>
+                {
+                    var dependency = await ctx.Dependencies().Require("openai").StartAsync();
+                    var value = await dependency.InvokeAsync("chat", new { prompt = "x" });
+                    var session = await dependency.InteractAsync(
+                        "chat",
+                        null,
+                        new InteractOptions { OnEvent = _ => { } });
+                    var final = await session.EndAsync();
+                    await dependency.DisposeAsync();
+                    return new Dictionary<string, object?> { ["value"] = value, ["final"] = final };
+                })
+                .OnCommand("stop-case", async (ctx, _) =>
+                {
+                    var dependency = await ctx.Dependencies().Require("openai").StartAsync();
+                    await dependency.StopAsync();
+                    return null;
+                }),
+            depChat: (interactResult: "end-ok", invokeResult: "chat-ok"));
+        var (host, runtime, depRuntime, callerSpawn) = fixture;
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = new RuntimeClient(
+                await host.RuntimeEndpointAsync(registerIndex: 1), callerSpawn.HostToRuntimeToken);
             var result = await client.InvokeAsync("dispose-case", null);
             var value = Assert.IsType<Dictionary<string, object?>>(BrickValueCodec.ToClr(result.Result));
             Assert.Equal("chat-ok", value["value"]);
             Assert.Equal("end-ok", value["final"]);
-            Assert.Equal("handle-1", host.ConnectorInvokes[0].HandleId);
-            Assert.Contains(("handle-1", false), host.DisposedDependencies);
+
+            var invoke = await host.WaitCallAsync(call =>
+                call.Path.EndsWith("BrickConnectorService/Invoke", StringComparison.Ordinal));
+            var handleId = invoke.Request.GetProperty("handleId").GetString();
+            Assert.False(string.IsNullOrEmpty(handleId));
+            var dispose = await host.WaitCallAsync(call =>
+                call.Path.EndsWith("BrickConnectorService/Dispose", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("handleId", out var id) &&
+                id.GetString() == handleId &&
+                call.Request.TryGetProperty("stop", out var stop) &&
+                stop.GetBoolean() == false);
 
             await client.InvokeAsync("stop-case", null);
-            Assert.Contains(("handle-2", true), host.DisposedDependencies);
+            await host.WaitCallAsync(call =>
+                call.Path.EndsWith("BrickConnectorService/Dispose", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("stop", out var stop) &&
+                stop.GetBoolean());
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            await depRuntime.DisposeAsync();
+            host.Dispose();
         }
     }
 
     [Fact]
     public async Task DependencyInvokeInsideCommandCarriesInvocationId()
     {
-        var host = await FakeHost.StartAsync();
-        host.ConnectorInvokeHandlers[("com.brickly.openai", "chat")] = _ => "ok";
-        host.ApplyEnvironment(Bindings);
-        var runtime = new BricklyRuntime().OnCommand("caller", async (ctx, _) =>
-        {
-            var dependency = ctx.Dependencies().Require("openai");
-            return await dependency.InvokeAsync("chat", new { prompt = "hi" });
-        });
-        await runtime.StartAsync();
-
+        var fixture = await StartDependencyFixtureAsync(
+            configureCaller: runtime => runtime.OnCommand("caller", async (ctx, _) =>
+            {
+                var dependency = ctx.Dependencies().Require("openai");
+                return await dependency.InvokeAsync("chat", new { prompt = "hi" });
+            }),
+            depChat: (interactResult: "unused", invokeResult: "ok"));
+        var (host, runtime, depRuntime, callerSpawn) = fixture;
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = new RuntimeClient(
+                await host.RuntimeEndpointAsync(registerIndex: 1), callerSpawn.HostToRuntimeToken);
             await client.InvokeAsync("caller", null, invocationId: "inv-dep");
-            Assert.Contains("inv-dep", host.ConnectorInvokeInvocationIds);
+            var invoke = await host.WaitCallAsync(call =>
+                call.Path.EndsWith("BrickConnectorService/Invoke", StringComparison.Ordinal));
+            Assert.Equal("inv-dep", invoke.InvocationId);
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            await depRuntime.DisposeAsync();
+            host.Dispose();
         }
     }
 
     [Fact]
     public async Task StartInCommandSendsInvocationId()
     {
-        var host = await FakeHost.StartAsync();
-        host.ApplyEnvironment(Bindings);
-        var runtime = new BricklyRuntime().OnCommand("starter", async (ctx, _) =>
-        {
-            var dependency = await ctx.Dependencies().Require("openai").StartAsync();
-            await dependency.DisposeAsync();
-            return null;
-        });
-        await runtime.StartAsync();
-
+        var fixture = await StartDependencyFixtureAsync(
+            configureCaller: runtime => runtime.OnCommand("starter", async (ctx, _) =>
+            {
+                var dependency = await ctx.Dependencies().Require("openai").StartAsync();
+                await dependency.DisposeAsync();
+                return null;
+            }),
+            depChat: null);
+        var (host, runtime, depRuntime, callerSpawn) = fixture;
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = new RuntimeClient(
+                await host.RuntimeEndpointAsync(registerIndex: 1), callerSpawn.HostToRuntimeToken);
             await client.InvokeAsync("starter", null, invocationId: "inv-start");
-            Assert.Contains("inv-start", host.StartedInvocationIds);
+            var start = await host.WaitCallAsync(call =>
+                call.Path.EndsWith("BrickConnectorService/Start", StringComparison.Ordinal));
+            Assert.Equal("inv-start", start.InvocationId);
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            await depRuntime.DisposeAsync();
+            host.Dispose();
         }
     }
 
     [Fact]
     public async Task DependencyInteractOutsideCommandRequiresHost()
     {
-        FakeHost.ClearEnvironment();
+        TestHostProcess.ClearEnvironment();
         await using var runtime = new BricklyRuntime();
         runtime.Dependencies.ReplaceFromJson(Bindings);
         var error = await Assert.ThrowsAsync<BppException>(
@@ -184,30 +207,32 @@ public sealed class DependencyTests
     [Fact]
     public async Task DependencyCallUsesCallIntent()
     {
-        var host = await FakeHost.StartAsync();
-        host.ConnectorInteractFinalResult = () => BrickValueCodec.FromClr("called");
-        host.ApplyEnvironment(Bindings);
-        var runtime = new BricklyRuntime().OnCommand("caller", async (ctx, _) =>
-        {
-            var dependency = ctx.Dependencies().Require("openai");
-            return await dependency.CallAsync(
-                "chat",
-                new { prompt = "x" },
-                new CallOptions { OnEvent = _ => { } });
-        });
-        await runtime.StartAsync();
-
+        var fixture = await StartDependencyFixtureAsync(
+            configureCaller: runtime => runtime.OnCommand("caller", async (ctx, _) =>
+            {
+                var dependency = ctx.Dependencies().Require("openai");
+                return await dependency.CallAsync(
+                    "chat",
+                    new { prompt = "x" },
+                    new CallOptions { OnEvent = _ => { } });
+            }),
+            depChat: (interactResult: "called", invokeResult: "unused"));
+        var (host, runtime, depRuntime, callerSpawn) = fixture;
         try
         {
-            using var client = TestHarness.CreateRuntimeClient(host, runtime);
+            using var client = new RuntimeClient(
+                await host.RuntimeEndpointAsync(registerIndex: 1), callerSpawn.HostToRuntimeToken);
             var result = await client.InvokeAsync("caller", null);
             Assert.Equal("called", BrickValueCodec.ToClr(result.Result));
-            Assert.Contains("call", host.ConnectorInteractIntents);
+            var interact = await host.WaitCallAsync(call =>
+                call.Path.EndsWith("BrickConnectorService/Interact", StringComparison.Ordinal));
+            Assert.Equal("call", interact.Intent);
         }
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            await depRuntime.DisposeAsync();
+            host.Dispose();
         }
     }
 
@@ -231,9 +256,15 @@ public sealed class DependencyTests
                     captured.TrySetResult(error);
                 }
             });
-            await TestHarness.WaitUntilAsync(() => host.SubscribedTopics.Contains("my-brick:tick"), 15_000);
+            await host.WaitCallAsync(call =>
+                call.Path.EndsWith("EventService/Subscribe", StringComparison.Ordinal) &&
+                call.Request.TryGetProperty("topic", out var t) &&
+                t.GetString() == "my-brick:tick", timeoutMs: 15_000);
 
-            host.PushDomainEvent("my-brick:tick", BrickValueCodec.FromClr(new { n = 1 }));
+            await host.PushEventAsync(
+                host.LastSpawn!.SpawnId,
+                "my-brick:tick",
+                new Dictionary<string, object?> { ["n"] = 1L });
             var error = await captured.Task.WaitAsync(TimeSpan.FromSeconds(15));
             var bpp = Assert.IsType<BppException>(error);
             Assert.Equal(BppErrorCodes.ParentInvocationRequired, bpp.Code);
@@ -241,14 +272,14 @@ public sealed class DependencyTests
         finally
         {
             await runtime.DisposeAsync();
-            await host.DisposeAsync();
+            host.Dispose();
         }
     }
 
     [Fact]
     public async Task StartInCommandWithoutHostIsProtocol()
     {
-        FakeHost.ClearEnvironment();
+        TestHostProcess.ClearEnvironment();
         await using var runtime = new BricklyRuntime().OnCommand("start-without-host", async (ctx, _) =>
         {
             await ctx.Dependencies().Require("openai").StartAsync();
@@ -263,5 +294,62 @@ public sealed class DependencyTests
                 null,
                 CancellationToken.None));
         Assert.Equal(BppErrorCodes.ProtocolError, error.Code);
+    }
+
+    /// <summary>
+    /// 双 runtime 装配：spawn 依赖 brick（com.brickly.openai installed/2.1.0）
+    /// + 调用方 brick；先起依赖 runtime 再起调用方（Register 录制下标 0/1）。
+    /// depChat: null 表示依赖 runtime 不注册命令。
+    /// </summary>
+    private static async Task<(
+        TestHostProcess Host,
+        BricklyRuntime Runtime,
+        BricklyRuntime DepRuntime,
+        TestHostProcess.SpawnInfo CallerSpawn)> StartDependencyFixtureAsync(
+        Action<BricklyRuntime> configureCaller,
+        (object? interactResult, object? invokeResult)? depChat)
+    {
+        var host = TestHostProcess.TryStart()
+            ?? throw new InvalidOperationException("真宿主测试工件不可用（需要 node + @syllm/brickly-test-host）");
+        try
+        {
+            var callerSpawn = await host.SpawnAsync("com.brickly.test-app");
+            var depSpawn = await host.SpawnAsync(
+                "com.brickly.openai", origin: "installed", version: "2.1.0");
+            // 合成能力 brick 须声明命令才是"可调用能力"（hasCommands=false 时
+            // connector.start 拒目标）；depRuntime 是否真注册 chat 不影响 start 路由
+            await host.EnableDependencyKernelAsync("chat");
+
+            host.ApplyEnvironment(depSpawn);
+            var depRuntime = new BricklyRuntime();
+            if (depChat is { } chat)
+            {
+                depRuntime.OnCommand("chat", (ctx, _) =>
+                {
+                    // interact 模式可注册 OnEvent；unary 下抛 ProtocolError → 回 invoke 罐头值
+                    try
+                    {
+                        ctx.OnEvent(_ => { });
+                        return Task.FromResult<object?>(chat.interactResult);
+                    }
+                    catch (BppException)
+                    {
+                        return Task.FromResult<object?>(chat.invokeResult);
+                    }
+                });
+            }
+            await depRuntime.StartAsync();
+
+            host.ApplyEnvironment(callerSpawn, dependencyBindings: Bindings);
+            var runtime = new BricklyRuntime();
+            configureCaller(runtime);
+            await runtime.StartAsync();
+            return (host, runtime, depRuntime, callerSpawn);
+        }
+        catch
+        {
+            host.Dispose();
+            throw;
+        }
     }
 }

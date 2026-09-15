@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using Brickly.Runtime.V1;
 using Syllm.Brickly.Sdk.Grpc;
 using Google.Protobuf;
@@ -7,27 +6,47 @@ using Grpc.Net.Client;
 
 namespace Syllm.Brickly.Sdk.Tests.TestSupport;
 
-/// <summary>测试装配：FakeHost + Runtime + Runtime 客户端。</summary>
+/// <summary>测试装配：真 test-host（子进程）+ Runtime + Runtime 裸客户端。</summary>
 public static class TestHarness
 {
-    public static async Task<(FakeHost Host, BricklyRuntime Runtime)> StartRuntimeAsync(
+    /// <summary>
+    /// 起真 test-host → /spawn 铸凭据 → 注入环境变量 → 启动 Runtime。
+    /// 宿主侧断言经 /calls 录制与驱动面端点完成（不再读假宿主内存态）。
+    /// </summary>
+    public static async Task<(TestHostProcess Host, BricklyRuntime Runtime)> StartRuntimeAsync(
         Action<BricklyRuntime>? configure = null,
         string? dependencyBindings = null,
-        string? profileConfig = null)
+        string? profileConfig = null,
+        string brickId = "com.brickly.test-app")
     {
-        var host = await FakeHost.StartAsync().ConfigureAwait(false);
-        host.ApplyEnvironment(dependencyBindings, profileConfig);
-        var runtime = new BricklyRuntime();
-        configure?.Invoke(runtime);
-        await runtime.StartAsync().ConfigureAwait(false);
-        return (host, runtime);
+        var host = TestHostProcess.TryStart()
+            ?? throw new InvalidOperationException("真宿主测试工件不可用（需要 node + @syllm/brickly-test-host）");
+        try
+        {
+            await host.SpawnAsync(brickId).ConfigureAwait(false);
+            host.ApplyEnvironment(dependencyBindings: dependencyBindings, profileConfig: profileConfig);
+            var runtime = new BricklyRuntime();
+            configure?.Invoke(runtime);
+            await runtime.StartAsync().ConfigureAwait(false);
+            return (host, runtime);
+        }
+        catch
+        {
+            host.Dispose();
+            throw;
+        }
     }
 
-    public static RuntimeClient CreateRuntimeClient(FakeHost host, BricklyRuntime runtime)
+    /// <summary>
+    /// 直连 runtime 的裸客户端（错 token / trailer 断言用；非假宿主——
+    /// 只是个 BrickCommandService client，正常驱动请走 host.InvokeAsync）。
+    /// </summary>
+    public static async Task<RuntimeClient> CreateRuntimeClientAsync(TestHostProcess host)
     {
-        var endpoint = host.Register?.Endpoint
-            ?? throw new InvalidOperationException("Runtime 尚未注册");
-        return new RuntimeClient(endpoint, host.HostToRuntimeToken);
+        var endpoint = await host.RuntimeEndpointAsync().ConfigureAwait(false);
+        var token = host.LastSpawn?.HostToRuntimeToken
+            ?? throw new InvalidOperationException("尚无 spawn 凭据");
+        return new RuntimeClient(endpoint, token);
     }
 
     public static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 5000)
@@ -42,9 +61,23 @@ public static class TestHarness
             await Task.Delay(20).ConfigureAwait(false);
         }
     }
+
+    /// <summary>异步版等待（谓词需要查控制面时用）。</summary>
+    public static async Task WaitUntilAsync(Func<Task<bool>> condition, int timeoutMs = 5000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (!await condition().ConfigureAwait(false))
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException("等待条件超时");
+            }
+            await Task.Delay(20).ConfigureAwait(false);
+        }
+    }
 }
 
-/// <summary>以 Host 身份调用 Runtime 的 BrickCommandService 客户端。</summary>
+/// <summary>以 Host 身份直连 Runtime 的 BrickCommandService 裸客户端。</summary>
 public sealed class RuntimeClient : IDisposable
 {
     private readonly GrpcChannel _channel;
@@ -90,117 +123,5 @@ public sealed class RuntimeClient : IDisposable
             .ResponseAsync;
     }
 
-    public AsyncDuplexStreamingCall<ClientFrame, ServerFrame> RawInteract() => _client.Interact(_metadata);
-
-    public async Task<ClientInteractSession> OpenInteractAsync(
-        string commandId,
-        object? input,
-        string? invocationId = null)
-    {
-        var metadata = new Metadata();
-        foreach (var entry in _metadata)
-        {
-            metadata.Add(entry);
-        }
-        if (!string.IsNullOrEmpty(invocationId))
-        {
-            metadata.Add("x-brickly-invocation-id", invocationId);
-        }
-        var call = _client.Interact(metadata);
-        var session = new ClientInteractSession(call);
-        await session.WriteAsync(new ClientFrame
-        {
-            Open = new OpenFrame { CommandId = commandId, Input = BrickValueCodec.FromClr(input) },
-        }).ConfigureAwait(false);
-        var first = await session.ReadAsync().ConfigureAwait(false);
-        if (first.Opened is null)
-        {
-            throw new InvalidOperationException("服务端首帧必须是 opened");
-        }
-        return session;
-    }
-
     public void Dispose() => _channel.Dispose();
-}
-
-/// <summary>Host 侧 interact 客户端会话。</summary>
-public sealed class ClientInteractSession
-{
-    private readonly AsyncDuplexStreamingCall<ClientFrame, ServerFrame> _call;
-    private ulong _outbound;
-
-    public ClientInteractSession(AsyncDuplexStreamingCall<ClientFrame, ServerFrame> call)
-    {
-        _call = call;
-    }
-
-    public Task WriteAsync(ClientFrame frame)
-    {
-        frame.Header ??= new FrameHeader();
-        frame.Header.Sequence = ++_outbound;
-        return _call.RequestStream.WriteAsync(frame);
-    }
-
-    /// <summary>原样写入（用于构造 sequence 违规等异常帧）。</summary>
-    public Task WriteRawAsync(ClientFrame frame) => _call.RequestStream.WriteAsync(frame);
-
-    public async Task<ServerFrame> ReadAsync(CancellationToken cancellationToken = default)
-    {
-        if (!await _call.ResponseStream.MoveNext(cancellationToken).ConfigureAwait(false))
-        {
-            throw new EndOfStreamException("interact 流已结束");
-        }
-        return _call.ResponseStream.Current;
-    }
-
-    public Task SendEventAsync(object? payload) =>
-        WriteAsync(new ClientFrame { Event = new EventFrame { Payload = BrickValueCodec.FromClr(payload) } });
-
-    public async Task<object?> RequestAsync(object? payload, CancellationToken cancellationToken = default)
-    {
-        var messageId = RandomMessageId();
-        await WriteAsync(new ClientFrame
-        {
-            Header = new FrameHeader { MessageId = ByteString.CopyFrom(messageId) },
-            Request = new RequestFrame { Payload = BrickValueCodec.FromClr(payload) },
-        }).ConfigureAwait(false);
-
-        while (true)
-        {
-            var frame = await ReadAsync(cancellationToken).ConfigureAwait(false);
-            if (frame.Response is not null &&
-                frame.Header is not null &&
-                frame.Header.ReplyTo.ToByteArray().AsSpan().SequenceEqual(messageId))
-            {
-                if (frame.Response.Error is not null)
-                {
-                    throw new BppException(frame.Response.Error.Code, frame.Response.Error.Message);
-                }
-                return BrickValueCodec.ToClr(frame.Response.Value);
-            }
-        }
-    }
-
-    public Task CloseInputAsync() => _call.RequestStream.CompleteAsync();
-
-    public async Task<ServerFrame> WaitForFinalAsync(CancellationToken cancellationToken = default)
-    {
-        while (true)
-        {
-            var frame = await ReadAsync(cancellationToken).ConfigureAwait(false);
-            if (frame.Final is not null)
-            {
-                return frame;
-            }
-        }
-    }
-
-    public void Dispose() => _call.Dispose();
-
-    private static byte[] RandomMessageId()
-    {
-        var id = new byte[16];
-        RandomNumberGenerator.Fill(id);
-        return id;
-    }
 }
