@@ -48,6 +48,7 @@ public sealed class PlatformApi
         Screen = new ScreenApi(runtime);
         Input = new InputApi(runtime);
         System = new SystemApi(runtime);
+        Search = new SearchApi(runtime);
     }
 
     public ClipboardApi Clipboard { get; }
@@ -59,6 +60,9 @@ public sealed class PlatformApi
     public InputApi Input { get; }
 
     public SystemApi System { get; }
+
+    /// <summary>快速搜索消费通道；manifest 须声明 quickSearch.consumer。</summary>
+    public SearchApi Search { get; }
 }
 
 /// <summary>runtime 剪贴板读写能力，对应 PlatformService clipboard.*。</summary>

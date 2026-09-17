@@ -49,6 +49,7 @@ SDK 自动完成：
 | 成员 | 作用 |
 | --- | --- |
 | `OnCommand(id, handler)` | 注册命令处理器（链式） |
+| `OnSearch(id, handler)` | 注册快速搜索 Provider 端点（manifest `provider: 'search'` 命令，链式） |
 | `InvokeAsync(commandId, input, ct)` | 再跑自己的一条命令；已有占用则不 Dispose |
 | `InteractAsync(commandId, input, opts, ct)` | 已有占用上再开会话；必须传 `OnEvent` |
 | `CallAsync(commandId, input, opts, ct)` | Interact + 半关闭的糖；与命令 `mode=call` 对齐 |
@@ -156,9 +157,49 @@ unsub();                                      // IDisposable
 ```
 
 - `ctx.UI()` 创建 **Call 窗口**（binding=call，随这次调用消失）；`Runtime.UI` 创建 **Session 窗口**（binding=session）。
-- 105 个反射方法按 `specs/window-protocol.schema.json` 生成并强类型包装；`win.CallAsync(method, args)` 可兜底调用宿主新方法。
+- 105 个反射方法 + 2 个宿主合成方法（`StartDragAsync`/`EndDragAsync`，frameless 浮窗原生拖拽）按 `specs/window-protocol.schema.json` 对齐并强类型包装；`win.CallAsync(method, args)` 可兜底调用宿主新方法。
 - `win.WebContents()` 提供 `webContents.*`；命令外发送必须带 parent（否则 `PARENT_INVOCATION_REQUIRED`）。
 - `win.On(event, handler)` 订阅 `closed / focus / blur / resize / ...`；`win.ExposeAsync(method, handler)` 处理子窗 request。
+
+---
+
+## 快速搜索
+
+Provider：manifest 中 `commands[].provider: 'search'` 标记的命令是快速搜索协议端点（只能被宿主搜索调用，不暴露普通入口），用 `OnSearch` 注册：
+
+```csharp
+runtime.OnSearch("find-files", ctx =>
+{
+    IReadOnlyList<SearchResultItem> results =
+    [
+        new SearchResultItem
+        {
+            Id = "a.txt",
+            Title = "a.txt",
+            Activate = new SearchRouteRef
+            {
+                Command = "open-file",
+                Input = new Dictionary<string, object?> { ["path"] = "a.txt" },
+            },
+        },
+    ];
+    return Task.FromResult(results);
+});
+```
+
+`ctx` 是 `SearchContext`：固定入参 `Query`（宿主已 trim，空查询不会到达）/ `Sequence` / `Limit` / `Caller`，能力面复用 `Platform()` / `Storage()` / `Dependencies()` / `CancellationToken`。`Activate` / `Actions[].Command` 的路由载荷只存宿主路由表，不下发消费方。
+
+Consumer：manifest 声明 `quickSearch.consumer` 后经 `runtime.Platform.Search.*` 调宿主搜索服务：
+
+```csharp
+var resp = await runtime.Platform.Search.QueryAsync(new SearchQueryRequest { Query = "open", Limit = 8 });
+var first = resp.Results.FirstOrDefault();
+if (first?.Activatable == true)
+{
+    await runtime.Platform.Search.ActivateAsync(first.Id!);
+    await runtime.Platform.Search.RunActionAsync(first.Id!, "reveal");
+}
+```
 
 ---
 
@@ -175,7 +216,7 @@ throw new BppException("INVALID_INPUT", "text is required");
 ## 协议与版本
 
 - 协议：`brickly.runtime.v1`（`Protocol.ProtocolVersion`）
-- SDK 版本：`0.11.0`（`Protocol.SdkVersion`），与 Node / Go / Python 基线一致
+- SDK 版本：`0.12.0`（`Protocol.SdkVersion`），与 Node / Go / Python 基线一致
 - 生成绑定：`buf.gen.yaml` 的 csharp 插件输出到 `src/Syllm.Brickly.Sdk/Grpc/Generated`，由 `npm run check:runtime-proto` 做漂移检查（禁止手改）
 
 ## 构建与测试

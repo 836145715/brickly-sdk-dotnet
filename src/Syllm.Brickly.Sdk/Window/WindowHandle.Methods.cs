@@ -101,6 +101,14 @@ public partial class WindowHandle
     public Task SetFullScreenAsync(bool flag, CancellationToken cancellationToken = default) =>
         CallVoidAsync("setFullScreen", new object?[] { flag }, cancellationToken);
 
+    /// <summary>进入宿主原生拖拽：页面 pointer down 后调用，宿主接管窗口移动直到 EndDrag。</summary>
+    public Task StartDragAsync(CancellationToken cancellationToken = default) =>
+        CallVoidAsync("startDrag", null, cancellationToken);
+
+    /// <summary>退出宿主原生拖拽。</summary>
+    public Task EndDragAsync(CancellationToken cancellationToken = default) =>
+        CallVoidAsync("endDrag", null, cancellationToken);
+
     // —— 3. 状态查询（23）——
 
     public Task<bool> IsDestroyedAsync(CancellationToken cancellationToken = default) => CallAsync<bool>("isDestroyed", null, cancellationToken);

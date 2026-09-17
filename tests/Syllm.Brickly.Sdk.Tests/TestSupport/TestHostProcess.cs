@@ -97,16 +97,25 @@ public sealed class TestHostProcess : IDisposable
         }
     }
 
+    // 每层先探 monorepo 本地构建产物（packages/brickly-test-host/dist，
+    // 反映当前源码），再探 node_modules 发布版（独立仓库唯一来源）。
+    // worktree 下 node_modules 里的包可能 junction 到主工作区旧构建，故本地产物优先。
     private static string? FindBundle()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir is not null)
         {
-            var candidate = Path.Combine(
-                dir.FullName, "node_modules", "@syllm", "brickly-test-host", "dist", "host.cjs");
-            if (File.Exists(candidate))
+            var local = Path.Combine(
+                dir.FullName, "packages", "brickly-test-host", "dist", "host.cjs");
+            if (File.Exists(local))
             {
-                return candidate;
+                return local;
+            }
+            var published = Path.Combine(
+                dir.FullName, "node_modules", "@syllm", "brickly-test-host", "dist", "host.cjs");
+            if (File.Exists(published))
+            {
+                return published;
             }
             dir = dir.Parent;
         }
@@ -172,6 +181,21 @@ public sealed class TestHostProcess : IDisposable
     public async Task<IReadOnlyList<RecordedCall>> CallsAsync()
     {
         var body = await _http.GetFromJsonAsync<CallsResponse>("/calls").ConfigureAwait(false);
+        return body?.Calls ?? [];
+    }
+
+    /// <summary>注册 search.* 平台方法罐头响应（method ∈ query/activate/runAction）。</summary>
+    public async Task SetSearchResponseAsync(string method, object? result)
+    {
+        var response = await _http.PostAsJsonAsync(
+            "/search-handler", new { method, result }).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>search.* 被调记录（method/input/callerBrickId），/reset 清空。</summary>
+    public async Task<IReadOnlyList<SearchCallRecord>> SearchCallsAsync()
+    {
+        var body = await _http.GetFromJsonAsync<SearchCallsResponse>("/search-calls").ConfigureAwait(false);
         return body?.Calls ?? [];
     }
 
@@ -423,6 +447,17 @@ public sealed class TestHostProcess : IDisposable
     private sealed class CallsResponse
     {
         [JsonPropertyName("calls")] public List<RecordedCall>? Calls { get; set; }
+    }
+
+    public sealed record SearchCallRecord(
+        [property: JsonPropertyName("method")] string Method,
+        [property: JsonPropertyName("input")] JsonElement Input,
+        [property: JsonPropertyName("callerBrickId")] string CallerBrickId,
+        [property: JsonPropertyName("at")] long At);
+
+    private sealed class SearchCallsResponse
+    {
+        [JsonPropertyName("calls")] public List<SearchCallRecord>? Calls { get; set; }
     }
 
     private sealed class ReadyInfo

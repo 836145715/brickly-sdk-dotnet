@@ -101,6 +101,18 @@ public sealed class BricklyRuntime : ICommandDispatcher, IAsyncDisposable
         return this;
     }
 
+    /// <summary>
+    /// 注册搜索 Provider 端点处理器（对应 manifest provider 标记命令）。
+    /// 入参/出参形状由协议定死：handler 收到 <see cref="SearchContext"/>，返回结果数组；
+    /// 畸形时回传 INVALID_INPUT / INTERNAL。
+    /// </summary>
+    public BricklyRuntime OnSearch(string commandId, SearchHandler handler)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(commandId);
+        ArgumentNullException.ThrowIfNull(handler);
+        return OnCommand(commandId, SearchBinding.Adapt(handler));
+    }
+
     /// <summary>注册 ready 钩子（注册成功后异步触发）。</summary>
     public BricklyRuntime OnReady(Func<Task> handler)
     {

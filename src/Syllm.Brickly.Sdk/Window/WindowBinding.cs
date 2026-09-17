@@ -7,7 +7,6 @@ internal static class WindowBinding
     private const string CallKeepAliveForbidden = "ctx.UI 不能 keepAlive，请使用 Runtime.UI";
     private const string CallBindingOnly = "ctx.UI 只能创建 Call 窗口";
     private const string SessionBindingOnly = "Runtime.UI 只能创建 Session 窗口";
-    private const string KeepAliveMustShow = "keepAlive 窗口创建时必须展示";
     private const string KeepAliveMismatch = "keepAlive 与 binding 不一致";
 
     /// <summary>ctx.UI 使用：stamps binding=call。</summary>
@@ -53,10 +52,8 @@ internal static class WindowBinding
             }
             keepAlive = topKeepAlive;
         }
-        if (keepAlive && !shown)
-        {
-            throw new BppException(BppErrorCodes.InvalidInput, KeepAliveMustShow);
-        }
+        // keepAlive 是生命周期承诺，与初始可见性正交：
+        // 常驻浮窗类 Brick 需要 keepAlive + show:false（隐藏创建，按命令/事件切换可见性）。
         cloned.Remove("lifetime");
         cloned.Remove("keepAlive");
         cloned["binding"] = new Dictionary<string, object?> { ["kind"] = "session", ["keepAlive"] = keepAlive };

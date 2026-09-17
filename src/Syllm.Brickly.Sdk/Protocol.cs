@@ -7,5 +7,5 @@ public static class Protocol
     public const string ProtocolVersion = "brickly.runtime.v1";
 
     /// <summary>SDK 发布版本（与 Node / Go / Python 包版本对齐）。</summary>
-    public const string SdkVersion = "0.11.0";
+    public const string SdkVersion = "0.12.0";
 }

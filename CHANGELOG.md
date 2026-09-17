@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.12.0 - 2026-09-17
+
+### Features
+
+- 快速搜索平台通道：消费方 `Platform.Search.QueryAsync` / `ActivateAsync` / `RunActionAsync`（渐进快照经 `search:snapshot` 定向事件回推）；Provider 砖用 `BricklyRuntime.OnSearch(commandId, handler)` 注册 manifest `provider: 'search'` 标记的命令端点。须在 manifest 声明 `quickSearch.consumer` / `quickSearch.provider`。
+- `WindowHandle.StartDragAsync()` / `EndDragAsync()`：frameless 浮窗原生拖拽接管（Windows 原生鼠标消息，macOS/Linux 光标位移）。
+- `UI.CreateBrowserWindowAsync` 的 `keepAlive` Session 窗允许 `show:false` 隐藏创建——keepAlive 是生命周期承诺，与初始可见性正交（放宽 0.11.0 的"创建时必须展示"）。
+
 ## 0.11.0 - 2026-09-13
 
 ### Features

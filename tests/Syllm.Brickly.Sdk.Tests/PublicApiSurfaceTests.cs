@@ -9,7 +9,7 @@ public sealed class PublicApiSurfaceTests
     public void PublicApiSurfaceExposesRuntimeApis()
     {
         Assert.Equal("brickly.runtime.v1", Protocol.ProtocolVersion);
-        Assert.Equal("0.11.0", Protocol.SdkVersion);
+        Assert.Equal("0.12.0", Protocol.SdkVersion);
 
         var runtimeType = typeof(BricklyRuntime);
         foreach (var property in new[] { "UI", "Events", "Platform", "System", "Dependencies", "Storage", "Config" })

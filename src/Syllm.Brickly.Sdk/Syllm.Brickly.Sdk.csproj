@@ -3,7 +3,7 @@
   <PropertyGroup>
     <RootNamespace>Syllm.Brickly.Sdk</RootNamespace>
     <AssemblyName>Syllm.Brickly.Sdk</AssemblyName>
-    <Version>0.11.0</Version>
+    <Version>0.12.0</Version>
     <PackageId>Syllm.Brickly.Sdk</PackageId>
     <Description>Brickly Brick .NET runtime SDK (brickly.runtime.v1)</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>

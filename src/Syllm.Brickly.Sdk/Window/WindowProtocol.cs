@@ -110,6 +110,8 @@ public static class BrickWindowMethods
         "webContents.selectAll",
         "webContents.undo",
         "webContents.redo",
+        "startDrag",
+        "endDrag",
     };
 }
 
